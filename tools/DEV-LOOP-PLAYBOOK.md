@@ -60,12 +60,19 @@ Pause the loop (keeps handlers/agents): `curl -s --noproxy '*' -X DELETE http://
 7. **Re-trigger a handled issue**: toggle its label (remove+re-add `agent-build`) → bumps updated_at
    → new Event.ID → re-fires. Dedup is per Event.ID (persisted in `~/.cma-stack/eventbus/<handler>.json`).
    Source `since` starts at `now` on (re)start, so it never replays history — only new activity fires.
-8. **UI features need real verification.** The reviewer agent is headless (no browser) → it verifies
-   build+test+code only, NOT rendered UI behavior. Use **Playwright** (Python; system Chrome headless
-   HANGS on this box — Playwright's bundled chromium is ~2s reliable). `ui-verify.py` builds a PR branch,
-   runs an isolated scheduler+UI, seeds state, drives the click-through, asserts + screenshots.
-   `python3 ~/.cma-stack/tools/ui-verify.py <owner/repo> <branch> <out.png>`. Reviewer can act on its
-   PASS/FAIL text but can't "see" the screenshot — visual judgment still needs a human.
+   **CAVEAT:** if the issue's NEWEST comment carries the bot marker (e.g. the agent's own
+   "Opened PR #N `<!-- cma-agent -->`"), the issue marker-guard suppresses the event and the label
+   toggle does nothing — post a NON-marker comment (or delete the marked one) to re-trigger. (A stale
+   keyed binding to a deleted session is fine: the bus checks `alive(sid)` and creates a fresh one.)
+8. **UI verification is part of the reviewer's job (v3+).** The reviewer's prompt makes it run a
+   headless UI smoke for any `internal/ui/`/frontend diff: `python3 ~/.cma-stack/tools/ui-smoke.py
+   <owner/repo> <branch> <out.png>` — builds the branch, runs an isolated scheduler+UI, loads the
+   console in Playwright's bundled chromium (system Chrome headless HANGS on this box; Playwright is
+   ~2s reliable), and returns `pass` + `console_errors` + a screenshot. The reviewer folds PASS/FAIL
+   into its verdict (JS errors / blank page ⇒ `changes`). **Honest limit:** it's a *functional* smoke —
+   the reviewer can act on PASS/FAIL text but CANNOT see the screenshot, so visual layout / feature
+   correctness still needs a human eye. `ui-verify.py` is the richer variant (seeds state + drives a
+   click-through) for feature-specific checks.
 9. **ahsir agent transcripts survive deletion** (`.a2a/transcripts/*.jsonl`, per-completed-turn), but the
    UI only lists registered agents. To view a deleted agent: re-register via `POST /admin/agents`
    `{name, workspace}` (no card → reuses the existing workspace, no re-scaffold). 30-day retention

@@ -104,9 +104,19 @@ TEST-COVERAGE ADEQUACY — a FIRST-CLASS part of your verdict, not optional:
     (exercised, not merely present). Spot-check the key new functions in that report.
   - If core logic or a plausible failure mode is untested, or the changed code's coverage is weak,
     verdict = changes, and name the specific tests you want (function + scenario).
-  - Pure-UI changes (frontend, no Go logic): say Go tests don't apply and that rendered/interactive
-    UI behavior is OUT of your headless scope — flag for a human / Playwright ui-verify. Don't
-    approve UI behavior you couldn't verify.
+  - Pure-UI changes (frontend, no Go logic): Go tests may not apply — do the UI smoke below instead.
+
+UI VERIFICATION — REQUIRED when the diff touches `internal/ui/` or any frontend asset:
+  - Run the headless smoke yourself (you have Bash + Playwright):
+      python3 ~/.cma-stack/tools/ui-smoke.py {REPO} <branch> /tmp/ui-<N>.png
+    It builds the branch, runs an isolated scheduler+UI, loads the console in headless Chromium, and
+    prints JSON: `pass`, `console_errors`, and a `screenshot` path.
+  - Fold the result into your verdict: `pass:false` (page didn't render) or any `console_errors` is a
+    `changes` verdict — the frontend is broken. State the PASS/FAIL and list any console errors.
+  - HONEST LIMIT: this is a *functional* smoke (page renders, no JS crash). You CANNOT see the
+    screenshot, so you cannot judge visual layout or whether the feature actually looks/behaves right.
+    Say so explicitly, and flag visual/interaction correctness for a human to eyeball (give the
+    screenshot path). A green smoke is necessary but not sufficient for a UI feature.
 
   4. Post the single verdict comment (build JSON with python3), ending with the correct marker.
      On approve, state build/test result AND your coverage assessment; say it's ready for human merge."""
