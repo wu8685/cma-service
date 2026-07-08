@@ -1,45 +1,28 @@
-// Package api exposes the CMA-compatible HTTP surface and drives ahsir behind it.
+// Package api exposes Hetairoi's event-bus control plane over HTTP. Hetairoi is
+// the event-driven scenario layer: it watches external sources and drives ahsir
+// agents through the official CMA SDK (internal/sdkdriver). The CMA API itself
+// lives in ahsir now — this package only serves the eventbus admin + webhook.
 package api
 
 import (
 	"encoding/json"
 	"net/http"
-	"sync"
-	"time"
 
-	"github.com/wu8685/hetairoi/internal/ahsir"
-	"github.com/wu8685/hetairoi/internal/cma"
 	"github.com/wu8685/hetairoi/internal/config"
 	"github.com/wu8685/hetairoi/internal/eventbus"
-	"github.com/wu8685/hetairoi/internal/store"
-	"github.com/wu8685/hetairoi/internal/translate"
 )
 
 type Server struct {
-	cfg   config.Config
-	store *store.Store
-	ahsir *ahsir.Client
-	rt    translate.RuntimeDefaults
-
-	regMu      sync.Mutex
-	registered map[string]bool // ahsir agent name -> registered this process
+	cfg config.Config
 
 	eventBus *eventbus.Bus      // optional; mounts the webhook when set
 	eventReg *eventbus.Registry // optional; mounts the dynamic sources/handlers API
-
-	// externalAgents = agents live outside this process's store (SDK-driver
-	// mode: the eventbus drives an external CMA facade). When set, handler
-	// creation skips the local agent-existence check.
-	externalAgents bool
 }
 
-// SetExternalAgents marks that agents are owned by an external CMA facade (not
-// this Server's store), so eventbus handler creation must not validate agent_id
-// against the local store. Call when wiring the SDK eventbus driver.
-func (s *Server) SetExternalAgents(v bool) { s.externalAgents = v }
+func New(cfg config.Config) *Server { return &Server{cfg: cfg} }
 
 // SetEventBus mounts an event bus, exposing its webhook at POST /eventbus/events
-// (behind the same x-api-key gate as the CMA API in v1). Call before Handler().
+// (behind the same x-api-key gate as the control plane). Call before Handler().
 func (s *Server) SetEventBus(b *eventbus.Bus) { s.eventBus = b }
 
 // SetEventRegistry mounts the dynamic control plane (POST/GET/DELETE
@@ -50,43 +33,9 @@ func (s *Server) SetEventRegistry(reg *eventbus.Registry) {
 	s.eventBus = reg.Bus()
 }
 
-func New(cfg config.Config, st *store.Store, ac *ahsir.Client) *Server {
-	return &Server{
-		cfg:        cfg,
-		store:      st,
-		ahsir:      ac,
-		rt:         translate.RuntimeDefaults{Provider: cfg.RuntimeProvider, BaseURL: cfg.RuntimeBaseURL, APIKey: cfg.RuntimeAPIKey},
-		registered: map[string]bool{},
-	}
-}
-
 // Handler builds the routed, authenticated http.Handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("POST /v1/agents", s.createAgent)
-	mux.HandleFunc("GET /v1/agents", s.listAgents)
-	mux.HandleFunc("GET /v1/agents/{id}", s.getAgent)
-	mux.HandleFunc("POST /v1/agents/{id}", s.updateAgent)
-	mux.HandleFunc("POST /v1/agents/{id}/archive", s.archiveAgent)
-
-	mux.HandleFunc("POST /v1/environments", s.createEnvironment)
-	mux.HandleFunc("GET /v1/environments", s.listEnvironments)
-	mux.HandleFunc("GET /v1/environments/{id}", s.getEnvironment)
-	mux.HandleFunc("POST /v1/environments/{id}", s.updateEnvironment)
-	mux.HandleFunc("POST /v1/environments/{id}/archive", s.archiveEnvironment)
-	mux.HandleFunc("DELETE /v1/environments/{id}", s.deleteEnvironment)
-
-	mux.HandleFunc("POST /v1/sessions", s.createSession)
-	mux.HandleFunc("GET /v1/sessions", s.listSessions)
-	mux.HandleFunc("GET /v1/sessions/{id}", s.getSession)
-	mux.HandleFunc("POST /v1/sessions/{id}", s.updateSession)
-	mux.HandleFunc("POST /v1/sessions/{id}/archive", s.archiveSession)
-	mux.HandleFunc("DELETE /v1/sessions/{id}", s.deleteSession)
-
-	mux.HandleFunc("POST /v1/sessions/{id}/events", s.sendEvents)
-	mux.HandleFunc("GET /v1/sessions/{id}/events", s.listEvents)
-	mux.HandleFunc("GET /v1/sessions/{id}/events/stream", s.streamEvents)
 
 	if s.eventBus != nil {
 		mux.Handle("POST /eventbus/events", s.eventBus.WebhookHandler())
@@ -128,16 +77,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// apiError is the error envelope (kept CMA-shaped for client familiarity, but
+// self-contained now that the CMA wire-type package has moved into ahsir).
+type apiError struct {
+	Type  string  `json:"type"`
+	Error errBody `json:"error"`
+}
+
+type errBody struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
 func writeErr(w http.ResponseWriter, status int, typ, msg string) {
-	writeJSON(w, status, cma.APIError{Type: "error", Error: cma.Err{Type: typ, Message: msg}})
+	writeJSON(w, status, apiError{Type: "error", Error: errBody{Type: typ, Message: msg}})
 }
 
 func decode(r *http.Request, v any) error {
 	defer r.Body.Close()
 	return json.NewDecoder(r.Body).Decode(v)
-}
-
-func newEvent(typ string) cma.Event {
-	now := time.Now().UTC()
-	return cma.Event{ID: cma.NewID(cma.PrefixEvent), Type: typ, ProcessedAt: &now}
 }

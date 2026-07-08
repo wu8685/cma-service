@@ -1,55 +1,42 @@
 package config
 
-import (
-	"os"
-	"path/filepath"
-	"testing"
-)
+import "testing"
 
-func TestResolveAhsirAdminToken(t *testing.T) {
-	// Isolate from the developer's real env/home for the file-discovery cases.
-	t.Setenv("CMA_AHSIR_ADMIN_TOKEN", "")
-	t.Setenv("AHSIR_ADMIN_TOKEN", "")
+func TestLoadDefaults(t *testing.T) {
+	t.Setenv("CMA_LISTEN", "")
+	t.Setenv("CMA_STATE_FILE", "")
+	t.Setenv("CMA_API_KEYS", "")
 
-	dir := t.TempDir()
-	cfg := filepath.Join(dir, "ahsir.yaml")
-	if err := os.WriteFile(filepath.Join(dir, "admin-token"), []byte("file-tok\n"), 0o600); err != nil {
-		t.Fatal(err)
+	c := Load()
+	if c.Listen != ":8787" {
+		t.Errorf("Listen = %q, want :8787", c.Listen)
 	}
+	if c.StateFile != "cma-state.json" {
+		t.Errorf("StateFile = %q, want cma-state.json", c.StateFile)
+	}
+	if len(c.APIKeys) != 0 {
+		t.Errorf("APIKeys = %v, want empty (allow-all)", c.APIKeys)
+	}
+}
 
-	t.Run("explicit env wins", func(t *testing.T) {
-		t.Setenv("CMA_AHSIR_ADMIN_TOKEN", "explicit")
-		t.Setenv("AHSIR_ADMIN_TOKEN", "ahsir-env")
-		t.Setenv("CMA_AHSIR_CONFIG", cfg)
-		if got := resolveAhsirAdminToken(); got != "explicit" {
-			t.Errorf("got %q, want explicit", got)
-		}
-	})
+func TestLoadOverridesAndAPIKeys(t *testing.T) {
+	t.Setenv("CMA_LISTEN", "127.0.0.1:18791")
+	t.Setenv("CMA_STATE_FILE", "/tmp/state.json")
+	t.Setenv("CMA_API_KEYS", "k1, k2 ,, k3")
 
-	t.Run("ahsir env over file", func(t *testing.T) {
-		t.Setenv("CMA_AHSIR_ADMIN_TOKEN", "")
-		t.Setenv("AHSIR_ADMIN_TOKEN", "ahsir-env")
-		t.Setenv("CMA_AHSIR_CONFIG", cfg)
-		if got := resolveAhsirAdminToken(); got != "ahsir-env" {
-			t.Errorf("got %q, want ahsir-env", got)
+	c := Load()
+	if c.Listen != "127.0.0.1:18791" {
+		t.Errorf("Listen = %q", c.Listen)
+	}
+	if c.StateFile != "/tmp/state.json" {
+		t.Errorf("StateFile = %q", c.StateFile)
+	}
+	for _, k := range []string{"k1", "k2", "k3"} {
+		if !c.APIKeys[k] {
+			t.Errorf("APIKeys missing %q (blank entries must be skipped)", k)
 		}
-	})
-
-	t.Run("admin-token file beside config, trimmed", func(t *testing.T) {
-		t.Setenv("CMA_AHSIR_ADMIN_TOKEN", "")
-		t.Setenv("AHSIR_ADMIN_TOKEN", "")
-		t.Setenv("CMA_AHSIR_CONFIG", cfg)
-		if got := resolveAhsirAdminToken(); got != "file-tok" {
-			t.Errorf("got %q, want file-tok", got)
-		}
-	})
-
-	t.Run("no token when nothing configured", func(t *testing.T) {
-		t.Setenv("CMA_AHSIR_ADMIN_TOKEN", "")
-		t.Setenv("AHSIR_ADMIN_TOKEN", "")
-		t.Setenv("CMA_AHSIR_CONFIG", filepath.Join(dir, "nonexistent", "ahsir.yaml"))
-		if got := resolveAhsirAdminToken(); got != "" {
-			t.Errorf("got %q, want empty", got)
-		}
-	})
+	}
+	if len(c.APIKeys) != 3 {
+		t.Errorf("APIKeys = %v, want exactly k1,k2,k3", c.APIKeys)
+	}
 }

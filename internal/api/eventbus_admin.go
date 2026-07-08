@@ -46,16 +46,8 @@ func (s *Server) createEventHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", "invalid body: "+err.Error())
 		return
 	}
-	// Validate the referenced agent exists, so a typo fails loudly at create
-	// time rather than at first dispatch. Skipped when agents live externally
-	// (SDK-driver mode): the eventbus no longer owns the agent store — the CMA
-	// facade validates the agent when the driver creates a session on it.
-	if !s.externalAgents {
-		if _, ok := s.store.Agent(spec.Policy.AgentID, spec.Policy.Version); !ok {
-			writeErr(w, http.StatusBadRequest, "invalid_request_error", "policy.agent_id not found: "+spec.Policy.AgentID)
-			return
-		}
-	}
+	// Agent-id validity is enforced by the CMA facade when the SDK driver creates
+	// a session on it — Hetairoi no longer owns a local agent store to check.
 	if err := s.eventReg.AddHandler(spec); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
