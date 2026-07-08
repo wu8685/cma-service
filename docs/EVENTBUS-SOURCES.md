@@ -11,8 +11,7 @@ webhook) with two capabilities:
 Both are mounted by `cmd/hetairoi` (built-in). The current end-to-end worked
 example is the autonomous dev loop: `tools/DEV-LOOP-PLAYBOOK.md` +
 `tools/setup-dev-loop.py` (two-port: CMA calls → the ahsir facade, eventbus wiring
-→ Hetairoi). The `example/*` dirs predate the CMA-gateway→ahsir migration and are
-illustrative only.
+→ Hetairoi).
 
 ## Sources
 
