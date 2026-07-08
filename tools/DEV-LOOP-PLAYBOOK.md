@@ -6,8 +6,10 @@ Goal of this doc: spin the **same formation** back up fast, without re-hitting t
 gotchas below.
 
 ## Stack it runs on
-- hetairoi `127.0.0.1:18790`, ahsir scheduler `:9800`, ahsir UI `:19801` — all
-  login LaunchAgents under `~/.cma-stack/` (see the hetairoi-autostart memory).
+- hetairoi eventbus `127.0.0.1:18791`, ahsir CMA facade `:18790`, ahsir scheduler
+  `:9800`, ahsir UI `:19801` — all login LaunchAgents under `~/.cma-stack/` (see the
+  hetairoi-autostart memory). hetairoi drives the facade over the official CMA SDK;
+  `setup-dev-loop.py` is two-port (CMA calls → facade :18790, eventbus wiring → :18791).
 - The `github` eventbus source lives in hetairoi (`internal/eventbus/source_github.go`,
   3-event model). Rebuild the deployed binary after code changes:
   `GO111MODULE=on go build -o ~/.cma-stack/bin/hetairoi ./cmd/hetairoi && codesign --force --sign - ~/.cma-stack/bin/hetairoi && launchctl kickstart -k gui/501/com.wu8685.hetairoi`
@@ -37,7 +39,7 @@ python3 ~/.cma-stack/tools/setup-dev-loop.py
 # 3. kick off: open an issue on the repo with the `agent-build` label. The 2m poll picks it up.
 # 4. watch: GitHub PR list, ahsir UI :19801, or `tail -f ~/.cma-stack/logs/ahsir.err`.
 ```
-Pause the loop (keeps handlers/agents): `curl -s --noproxy '*' -X DELETE http://127.0.0.1:18790/v1/eventbus/sources/gh-ahsir-loop`
+Pause the loop (keeps handlers/agents): `curl -s --noproxy '*' -X DELETE http://127.0.0.1:18791/v1/eventbus/sources/gh-ahsir-loop`
 
 ## Gotchas (the expensive-to-rediscover ones)
 1. **Loopback proxy.** This box has `http_proxy=127.0.0.1:7897`; loopback dies unless

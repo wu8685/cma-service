@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 import json, urllib.request
 
-BASE = "http://127.0.0.1:18790"
+# Post-migration topology: the CMA API (agents/environments/sessions) is served
+# by ahsir's own facade on :18790; the eventbus control plane stays in Hetairoi
+# on :18791. Route each call to the right surface by path.
+FACADE_BASE = "http://127.0.0.1:18790"    # ahsir CMA facade
+EVENTBUS_BASE = "http://127.0.0.1:18791"  # Hetairoi eventbus admin
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # no proxy on loopback
 
 def call(method, path, body=None):
+    base = EVENTBUS_BASE if path.startswith("/v1/eventbus") else FACADE_BASE
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(BASE + path, data=data, method=method,
-                                 headers={"content-type": "application/json"})
+    hdrs = {"content-type": "application/json"}
+    if base == FACADE_BASE:
+        hdrs["x-api-key"] = "sk-cma-local"  # facade allows any key locally
+    req = urllib.request.Request(base + path, data=data, method=method, headers=hdrs)
     try:
         with OPENER.open(req) as r:
             return json.load(r)
@@ -17,7 +24,7 @@ def call(method, path, body=None):
 REPO = "wu8685/ahsir"
 TOKEN_FILE = "/Users/wu8685/.cma-stack/github-token"
 
-# ---- clean up the old hetairoi-repo handlers (they'd intercept ahsir issues) ----
+# ---- clean up the old Hetairoi-repo handlers (they'd intercept ahsir issues) ----
 for h in ("gh-issues", "gh-prs"):
     try:
         call("DELETE", "/v1/eventbus/handlers/" + h); print("deleted old handler", h)
@@ -126,12 +133,16 @@ print("env:", env["id"])
 
 coder = call("POST", "/v1/agents", {
     "name": "ahsir-coder", "model": {"id": "claude-opus-4-8"}, "system": CODER_SYS,
-    "metadata": {"shell_access": "true", "runtime_timeout": "2400s"}})
+    # runtime_timeout "0" => NO per-turn ahsir cap (session_claude.go: `if Timeout>0`).
+    # Chosen (2026-07-08) to stop big-feature turns getting cut; the backstop against a
+    # runaway/wedged turn is future monitoring/alerting (not a hard timeout). CMA_TURN_TIMEOUT
+    # is set to 720h in the plist (can't be 0 — handlers.go forces 10m on <=0).
+    "metadata": {"shell_access": "true", "runtime_timeout": "0"}})
 print("coder:", coder["id"])
 
 reviewer = call("POST", "/v1/agents", {
     "name": "ahsir-reviewer", "model": {"id": "claude-opus-4-8"}, "system": REVIEWER_SYS,
-    "metadata": {"shell_access": "true", "runtime_timeout": "1800s"}})
+    "metadata": {"shell_access": "true", "runtime_timeout": "0"}})  # no per-turn cap (see coder note)
 print("reviewer:", reviewer["id"])
 
 BUILD_PROMPT = """MODE A — BUILD. A labeled issue needs implementing on {{.payload.repo}}.
