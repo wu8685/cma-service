@@ -6,12 +6,14 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 
 	"github.com/wu8685/cma-service/internal/ahsir"
 	"github.com/wu8685/cma-service/internal/api"
 	"github.com/wu8685/cma-service/internal/config"
 	"github.com/wu8685/cma-service/internal/eventbus"
+	"github.com/wu8685/cma-service/internal/sdkdriver"
 	"github.com/wu8685/cma-service/internal/store"
 )
 
@@ -30,7 +32,21 @@ func main() {
 	// handlers} let an operator wire CodeHub/workitem event monitoring at runtime;
 	// persisted specs are rebuilt here on boot.
 	busDir := filepath.Dir(cfg.StateFile)
-	bus := eventbus.New(srv.BusDriver(), busDir, 8)
+
+	// Driver selection (migration P2): default is the in-process gateway
+	// (BusDriver). Opt into the CMA-SDK client by setting CMA_EVENTBUS_DRIVER=sdk
+	// + CMA_FACADE_URL — the eventbus then drives ahsir's CMA facade through the
+	// official anthropic-sdk-go, exactly as an external CMA client would.
+	var driver eventbus.SessionDriver = srv.BusDriver()
+	if os.Getenv("CMA_EVENTBUS_DRIVER") == "sdk" {
+		facadeURL := os.Getenv("CMA_FACADE_URL")
+		if facadeURL == "" {
+			log.Fatalf("CMA_EVENTBUS_DRIVER=sdk requires CMA_FACADE_URL (the ahsir CMA facade base URL)")
+		}
+		driver = sdkdriver.New(facadeURL, os.Getenv("CMA_API_KEY"))
+		log.Printf("eventbus driver: sdk (facade=%s)", facadeURL)
+	}
+	bus := eventbus.New(driver, busDir, 8)
 	reg, err := eventbus.NewRegistry(context.Background(), bus, busDir)
 	if err != nil {
 		log.Fatalf("event bus registry: %v", err)
