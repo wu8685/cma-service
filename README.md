@@ -1,77 +1,63 @@
-# hetairoi
+# Hetairoi
 
-An **Anthropic Managed Agents (CMA) compatible API**, backed by an
-[ahsir](https://github.com/wu8685/ahsir) agent fleet.
+**Connect real-world events to your agent fleet.** Hetairoi watches the sources
+you care about — GitHub issues and PRs, code-review queues, work items — and, when
+something happens, **summons the right agent to act on it**. Autonomously.
 
-Point the official `anthropic` SDK at this service's `base_url` and drive it as a
-drop-in: create agents, environments, sessions, send events, stream the agent's
-output. Internally each session is served by an ahsir agent process.
+Point it at an [ahsir](https://github.com/wu8685/ahsir) agent fleet and Hetairoi
+becomes the layer that turns "an issue was labeled" or "a PR was pushed" into "an
+agent picked it up, did the work, and reported back."
+
+> *Ἑταῖροι* — Iskandar's Companion cavalry, the army that materializes to answer
+> the king's call (Fate/Zero, «Ionioi Hetairoi»). ahsir is the fleet; Hetairoi is
+> what rallies it when the world calls.
+
+## What you get
+
+- **Watch anything.** Built-in sources poll GitHub / CodeHub / work-item queues;
+  a webhook lets anything else push events in.
+- **Route by rule, not by code.** Declarative handlers match an event and hand it
+  to a policy — start a fresh session, reuse a keyed one, or let a router agent
+  decide — no redeploy to change the wiring.
+- **Agents that actually do the work.** Each event becomes a real agent turn on
+  your ahsir fleet: a coder implements, a reviewer reviews, a triager triages.
+- **Runs itself.** Dedup, per-session ordering, crash-safe event logs, and a human
+  hand-off gate come out of the box.
+
+## The flagship: an autonomous dev loop
+
+Label a GitHub issue `agent-build` and walk away:
+
+1. Hetairoi sees the labeled issue → a **coder** agent implements it, opens a PR.
+2. The PR push → a **reviewer** agent builds, tests, and posts a verdict.
+3. `changes requested` → the coder revises; `approved` → Hetairoi **stops** and
+   waits for a human to merge.
+
+No glue scripts, no CI plumbing — just agents answering events.
+
+## How it fits
 
 ```
-official anthropic SDK ──/v1/agents, /v1/environments, /v1/sessions,
-                          /v1/sessions/{id}/events[/stream]──▶ hetairoi ──▶ ahsir gateway
+GitHub / CodeHub / webhooks ─▶ Hetairoi (eventbus) ─▶ ahsir CMA facade ─▶ agent fleet
+        (the world)              match → policy          (runs the turn)     (does the work)
 ```
 
-## What it maps
+Hetairoi is a **client** of ahsir's agent API — it drives the fleet through the
+official Anthropic SDK. Your agents, their sessions, and their state live on ahsir;
+Hetairoi is the trigger-and-orchestrate layer in front of them.
 
-| CMA concept | ahsir backing |
-|---|---|
-| Agent (versioned config: model/system/skills/mcp) | an ahsir agent (`agent-card.yaml`); each `(agent_id, version)` → a distinct ahsir agent `cma-<id>-v<n>` |
-| Environment | logical resource (synthesized `env_id`); isolation via ahsir's workspace + `filesystem` allow-list |
-| Session | `session_id → (ahsir agent name, contextId)` |
-| `events.send(user.message)` | `POST /agents/{name}/chat` |
-| `events.stream` (SSE) | live tail; MVP: one `agent.message` + `session.status_idle` per turn |
-| `events.list` | event log (history replay) |
+## Get started
 
-Versioning lives entirely here — ahsir stays version-agnostic.
-
-## Status (P1 + P2)
-
-Implemented and exercised end-to-end by the official SDK (`e2e/`, 9/9 green;
-`go test ./...` green under `-race`): agents (create / retrieve / version / list),
-environments, sessions (create / retrieve / archive / list), `user.message`,
-`user.interrupt`, live event stream (`session.status_running` → `agent.message` →
-`session.status_idle`), event list with cursor pagination.
-
-Turns run over the A2A `message/stream` transport (deltas buffered into one
-`agent.message`), strictly serialized per session, with events persisted on append.
-`user.interrupt` cancels a live turn via A2A `tasks/cancel`. Session archive reclaims
-the backing ahsir agent only when no other live session pins that `(agent_id,
-version)`.
-
-**Deferred:** custom tools, `user.tool_confirmation`, multiagent, outcomes, webhooks,
-vaults/MCP auth; `agent.thinking` / `agent.tool_use` events (need ahsir to surface
-those on its A2A wire). Token-incremental CMA streaming is not expressible in the
-current SDK (`agent.message` is a complete message, no delta event) — see
-`docs/ROADMAP.md`.
-
-## Validated end to end against real ahsir + a real LLM
-
-The full stack was run against a **real ahsir scheduler + DeepSeek** (2026-06-14):
-`sessions.create` → inline ahsir registration (`POST /admin/agents` with an inline
-`card`) → real `ahsir-agent` spawn → real streaming reply → multi-turn context
-continuity → `user.interrupt` aborting the in-flight turn within ~1s. The ahsir-side
-changes (inline registration + streaming cancel) are in `../ahsir`; see
-`docs/ROADMAP.md` → "Real-run validation".
-
-## Run
+Run `ahsir` (with its CMA facade) and point Hetairoi at it:
 
 ```sh
-# needs Go 1.23+
-CMA_LISTEN=127.0.0.1:8787 \
-CMA_AHSIR_URL=http://127.0.0.1:9800 \
-CMA_AHSIR_ADMIN_TOKEN=... \
-go run ./cmd/hetairoi
+CMA_FACADE_URL=http://127.0.0.1:18790 \
+CMA_LISTEN=127.0.0.1:18791 \
+GO111MODULE=on go run ./cmd/hetairoi
 ```
 
-Config (env): `CMA_LISTEN`, `CMA_AHSIR_URL`, `CMA_AHSIR_ADMIN_TOKEN`,
-`CMA_API_KEYS` (comma-separated; empty = open), `CMA_STATE_FILE`,
-`CMA_RUNTIME_PROVIDER` / `CMA_RUNTIME_BASE_URL` / `CMA_RUNTIME_API_KEY`
-(provider credentials baked into every ahsir agent card).
-
-## Tests
-
-```sh
-go test ./...        # unit (when added)
-./e2e/run.sh         # official-SDK end-to-end (see e2e/README.md)
-```
+Then declare sources and handlers over the control-plane API (`/v1/eventbus/…`) —
+see **[docs/EVENTBUS-SOURCES.md](docs/EVENTBUS-SOURCES.md)** for sources and the
+dynamic control plane, and **[docs/EVENTBUS-SPEC.md](docs/EVENTBUS-SPEC.md)** for the
+policy model. Architecture and design rationale live in
+**[docs/DESIGN.md](docs/DESIGN.md)**.

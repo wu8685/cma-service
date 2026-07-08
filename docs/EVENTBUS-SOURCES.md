@@ -8,9 +8,11 @@ webhook) with two capabilities:
 2. **A runtime control plane** — `POST/GET/DELETE /v1/eventbus/{sources,handlers}`
    so monitoring is configured with HTTP requests, not recompiled-in Go.
 
-Both are mounted by `cmd/hetairoi` (built-in). Worked example:
-[`example/eventbus-dynamic`](../example/eventbus-dynamic). The compiled-in
-counterpart is [`example/pr-review`](../example/pr-review).
+Both are mounted by `cmd/hetairoi` (built-in). The current end-to-end worked
+example is the autonomous dev loop: `tools/DEV-LOOP-PLAYBOOK.md` +
+`tools/setup-dev-loop.py` (two-port: CMA calls → the ahsir facade, eventbus wiring
+→ Hetairoi). The `example/*` dirs predate the CMA-gateway→ahsir migration and are
+illustrative only.
 
 ## Sources
 
@@ -181,25 +183,30 @@ the **Bash** tool. ahsir deliberately withholds Bash from claude agents — the
 `--allowedTools` whitelist is `Read,LS,Glob,Grep` (+`Edit,MultiEdit,Write` with
 write access), and `--dangerously-skip-permissions` is stripped from raw args.
 
-The sanctioned widening is the **`filesystem.shell_access`** card knob (added in
-ahsir). hetairoi maps agent **metadata** to it:
+The sanctioned widening is the **`filesystem.shell_access`** card knob (in ahsir).
+It's set through the agent's `metadata` when the agent is created **on the ahsir CMA
+facade** (agents live there, not on Hetairoi):
 
 | agent metadata key | card field             | effect                         |
 |--------------------|------------------------|--------------------------------|
 | `shell_access: "true"` | `filesystem.shell_access` | adds `Bash` to allowedTools |
-| `runtime_timeout: "900s"` | `runtime.timeout`   | widen ahsir's 120s turn cap    |
+| `runtime_timeout: "900s"` | `runtime.timeout`   | widen ahsir's default turn cap |
 
 ```sh
-curl -X POST :8787/v1/agents -d '{"name":"pr-reviewer","model":{"id":"claude-sonnet-4-6"},
-  "system":"<review procedure>","metadata":{"shell_access":"true","runtime_timeout":"900s"}}'
+# create the agent on the ahsir facade (CMA API), not on Hetairoi:
+curl -X POST http://127.0.0.1:18790/v1/agents -H "x-api-key: $CMA_API_KEY" \
+  -d '{"name":"pr-reviewer","model":{"id":"claude-sonnet-4-6"},
+       "system":"<review procedure>","metadata":{"shell_access":"true","runtime_timeout":"900s"}}'
 ```
 
-Without `shell_access` the agent can read/edit files but cannot run `git` or
-`codehub` — so an action-taking review agent must set it.
+A handler on Hetairoi then references that agent's id in its policy; the SDK driver
+creates sessions for it on the facade. Without `shell_access` the agent can read/edit
+files but cannot run `git`/`codehub` — so an action-taking agent must set it.
 
-## Admin token
+## Facade auth
 
-hetairoi auto-discovers the ahsir control-plane token like the ahsir CLI:
-`CMA_AHSIR_ADMIN_TOKEN` → `AHSIR_ADMIN_TOKEN` → the `admin-token` file beside the
-ahsir config (`CMA_AHSIR_CONFIG`, default `~/.ahsir/admin-token`). For a local
-same-user setup, no token wiring is needed.
+Hetairoi reaches ahsir through the CMA facade, authenticated with `CMA_API_KEY`
+(`CMA_FACADE_URL` points at the facade). It no longer talks to ahsir's scheduler
+admin surface directly, so no ahsir admin token is wired into Hetairoi — the facade
+handles agent registration on ahsir's side. For a local same-user setup, an empty
+key is fine (the facade is open to loopback).

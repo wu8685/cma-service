@@ -19,10 +19,11 @@ deferred to after custom tools, see §11).
 
 ## 2. Boundary
 
-- A **Go package** inside hetairoi with its own external interface (webhook).
-- In-process: it drives sessions through a **SessionDriver** interface that
-  hetairoi implements over its existing session/turn machinery — no HTTP
-  self-loop. The bus depends only on the interface (testable against a fake).
+- A **Go package** inside Hetairoi with its own external interface (webhook).
+- It drives sessions through a **SessionDriver** interface; the bus depends only
+  on that interface (testable against a fake). The sole implementation is
+  `internal/sdkdriver`, which fulfils it by calling ahsir's CMA facade through the
+  official `anthropic-sdk-go` — Hetairoi owns no session/turn machinery of its own.
 
 ```go
 type SessionDriver interface {

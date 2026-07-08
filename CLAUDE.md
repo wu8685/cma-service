@@ -1,60 +1,80 @@
-# hetairoi — agent orientation
+# Hetairoi — agent orientation
 
-This project is a **gateway** that exposes an **Anthropic Managed Agents (CMA)
-compatible HTTP API**, backed internally by an [ahsir](https://github.com/wu8685/ahsir)
-agent fleet. The official `anthropic` SDK, pointed at this service's `base_url`,
-drives it as a drop-in.
+Hetairoi is the **event-driven scenario layer** over an
+[ahsir](https://github.com/wu8685/ahsir) agent fleet. It watches external sources
+(GitHub issues/PRs, CodeHub, work items), matches events with declarative handlers,
+and **dispatches ahsir agents to act** — creating sessions and running turns on
+ahsir's CMA API through the official `anthropic-sdk-go`. It is a CMA **client**, not
+a CMA server: agents, sessions, and their state live on the ahsir facade, not here.
 
-**Read first:** `docs/DESIGN.md` (architecture, concept mapping, wire-shape rules,
-ahsir contract) and `docs/ROADMAP.md` (status, phases, the pending ahsir change,
-how to verify wire shapes). `README.md` is the short version.
+(The CMA gateway used to live in this repo; it moved into ahsir — see
+`docs/RFC-001-cma-gateway-into-ahsir.md` for that history.)
+
+**Read first:** `docs/DESIGN.md` (architecture + rationale), `docs/EVENTBUS-SPEC.md`
+(the policy model), `docs/EVENTBUS-SOURCES.md` (sources + control plane). `README.md`
+is the value pitch.
 
 ## Repo map
 
 ```
-cmd/hetairoi/      entrypoint
-internal/cma/         CMA wire types (the external API surface) + ids
-internal/ahsir/       ahsir gateway client + inline AgentCard
-internal/translate/   CMA agent → ahsir card; (agent_id,version) → ahsir name
-internal/store/       resources + session↔(name,contextId) + event bus (JSON persist)
-internal/api/         routing + auth + handlers + turn execution
-e2e/                  official-SDK end-to-end tests + fakeahsir backend
+cmd/hetairoi/       entrypoint: wire the SDK driver + eventbus, serve the control plane
+internal/sdkdriver/ eventbus.SessionDriver on the official anthropic-sdk-go
+                    (Sessions.New / Events.Send / StreamEvents / List) → drives ahsir's CMA facade
+internal/eventbus/  sources + handlers/policies + bus + registry + webhook — the core
+internal/api/       slim HTTP: eventbus admin (/v1/eventbus/{sources,handlers}) + webhook (/eventbus/events) + auth
+internal/config/    Listen / APIKeys / StateFile
 ```
+
+The seam between the two halves is `eventbus.SessionDriver`
+(`CreateSession / SendUserMessage / RunForReply / SessionSummary`) — the eventbus is
+runtime-agnostic; `internal/sdkdriver` is the only implementation, backed by the SDK.
+
+## Topology (deployed)
+
+```
+ahsir:  scheduler :9800  +  CMA facade :18790
+Hetairoi:  eventbus-only :18791  ──CMA_FACADE_URL──▶ ahsir facade :18790  (official SDK)
+```
+
+Both run as login LaunchAgents under `~/.cma-stack/` (see the project memory).
 
 ## Build / test (this machine)
 
 - Module is inside `GOPATH/src` with `GO111MODULE=off` global → **prefix with `GO111MODULE=on`**.
-- This Mac **SIGKILLs directly-run freshly-built binaries** → use **`go run`**, not a built binary.
+- This Mac **SIGKILLs directly-run freshly-built binaries** → use `go run`, or codesign the binary (`codesign --force --sign - <bin>`) before running it.
 
 ```sh
-GO111MODULE=on go build ./...        # compile check
+GO111MODULE=on go build ./...
 GO111MODULE=on go vet ./...
-GO111MODULE=on go run ./cmd/hetairoi   # run the server (not a built binary)
-python3 -m pip install -r e2e/requirements.txt
-./e2e/run.sh                          # official-SDK e2e (boots fakeahsir + hetairoi via go run)
+GO111MODULE=on go test -short ./...     # unit; the sdkdriver integration test is -short/env-gated
+CMA_FACADE_URL=http://127.0.0.1:18790 CMA_LISTEN=127.0.0.1:18791 \
+  GO111MODULE=on go run ./cmd/hetairoi
 ```
+
+The full-path check is `internal/sdkdriver/driver_integration_test.go`: it boots a
+real `ahsir start --cma-listen` (echo provider) and drives the SDK `SessionDriver`
+against it end to end.
 
 ## Constraints that matter
 
-1. **Keep response shapes aligned to the installed `anthropic` SDK.** Do not guess —
-   introspect the SDK's pydantic models before changing any response (recipe in
-   `docs/ROADMAP.md` → "How to verify wire shapes"). The required-field gotchas are in
-   `docs/DESIGN.md` → "Wire-shape alignment".
-2. **Versioning lives here, not in ahsir.** Each `(agent_id, version)` → a distinct
-   ahsir agent `cma-<id>-v<n>`. ahsir is version-agnostic.
-3. **Any ahsir-side change is discussed with the ahsir maintainer first.** ahsir stays a pure agent
-   runtime. The one pending ahsir change (inline agent registration) is specced in
-   `docs/ROADMAP.md`; hetairoi already speaks that contract.
-4. **`e2e/` must stay green.** It's the contract check against the real SDK.
+1. **It's a CMA client, not a server.** Agents/environments/sessions live on the
+   ahsir facade. Hetairoi never owns agent state; don't reintroduce a local store or
+   the `/v1/{agents,environments,sessions}` routes — those are ahsir's now.
+2. **The SDK driver is the only path to ahsir.** All fleet interaction goes through
+   `internal/sdkdriver` (official `anthropic-sdk-go` → `CMA_FACADE_URL`). This
+   dogfoods ahsir's CMA API; keep it that way.
+3. **The eventbus is the core.** Sources/handlers/policies/dedup/persistence in
+   `internal/eventbus`. New capability is usually a new source or policy, not a new
+   HTTP surface.
+4. **Deploy + restart order.** Rebuild `~/.cma-stack/bin/hetairoi` + codesign, then
+   `bootout`+`bootstrap` `com.wu8685.hetairoi`. If you ever restart the whole stack,
+   bring cma-stack ports up so ahsir binds `:18790` before Hetairoi points at it.
+5. **`CMA_*` env prefix is intentional.** Hetairoi *is* a CMA client, so
+   `CMA_FACADE_URL` / `CMA_API_KEY` read correctly; the prefix was kept on purpose.
 
 ## Current status
 
-P1 + P2 done and e2e-green (9/9), `go test ./...` green under `-race`. On top of the
-MVP: turns run over the A2A `message/stream` transport (deltas buffered into one
-`agent.message`, since the CMA SDK `agent.message` has no delta field); per-session
-FIFO turn serialization; immediate event persistence; `events.list` cursor pagination;
-`user.interrupt` → A2A `tasks/cancel`; refcount-aware session archive GC. The ahsir
-inline-registration change **landed** in `../ahsir` (card json tags + `WriteCard` +
-managed-workspace scaffolding) — a full real turn still needs a live LLM provider.
-Next is P3 (`agent.thinking`/`agent.tool_use`, multiagent, outcomes, custom tools).
-See `docs/ROADMAP.md`.
+Migration complete: the CMA gateway lives in ahsir; Hetairoi is eventbus +
+official-SDK-client only. Live-validated end to end — labeling a GitHub issue
+`agent-build` drove the full autonomous dev loop (coder → PR → reviewer → verdict)
+through the new architecture. See `docs/ROADMAP.md`.
