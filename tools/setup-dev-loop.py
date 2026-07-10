@@ -21,7 +21,9 @@ def call(method, path, body=None):
     except urllib.error.HTTPError as e:
         print("  ERROR", method, path, e.code, e.read().decode()[:300]); raise
 
-REPO = "wu8685/ahsir"
+REPO = "wu8685/ahsir"                              # agents' "home" repo (system-prompt framing)
+WATCH_REPOS = ["wu8685/ahsir", "wu8685/hetairoi"]  # one github source per repo; the loop
+                                                   # dogfoods itself by watching hetairoi too.
 TOKEN_FILE = "/Users/wu8685/.cma-stack/github-token"
 
 # ---- clean up the old Hetairoi-repo handlers (they'd intercept ahsir issues) ----
@@ -176,27 +178,36 @@ h1 = call("POST", "/v1/eventbus/handlers", {
     # `<!-- cma-approve -->` comment). A label alone never starts work. See the trust
     # boundary in docs/EVENTBUS-SOURCES.md.
     "match": {"type": "issue", "payload_equals": {"authorized": "true"}},
+    # Keys are REPO-QUALIFIED ({{.payload.repo}}#...) so that watching more than one
+    # repo (see WATCH_REPOS) can't collide two different repos' issue #N onto one
+    # keyed session. build↔fix share the same key so the coder that built an issue
+    # also fixes it, with context.
     "policy": {"kind": "keyed", "agent_id": coder["id"], "env_id": env["id"],
-               "key_template": "issue-{{.subject}}", "prompt_template": BUILD_PROMPT}})
+               "key_template": "{{.payload.repo}}#issue-{{.subject}}", "prompt_template": BUILD_PROMPT}})
 print("handler:", h1["name"])
 
 h2 = call("POST", "/v1/eventbus/handlers", {
     "name": "ahsir-review",
     "match": {"type": "pr.push", "payload_equals": {"is_agent_pr": "true"}},
     "policy": {"kind": "keyed", "agent_id": reviewer["id"], "env_id": env["id"],
-               "key_template": "pr-{{.subject}}", "prompt_template": REVIEW_PROMPT}})
+               "key_template": "{{.payload.repo}}#pr-{{.subject}}", "prompt_template": REVIEW_PROMPT}})
 print("handler:", h2["name"])
 
 h3 = call("POST", "/v1/eventbus/handlers", {
     "name": "ahsir-fix",
     "match": {"type": "pr.review", "payload_equals": {"review_verdict": "changes"}},
     "policy": {"kind": "keyed", "agent_id": coder["id"], "env_id": env["id"],
-               "key_template": "issue-{{.payload.issue_ref}}", "prompt_template": FIX_PROMPT}})
+               "key_template": "{{.payload.repo}}#issue-{{.payload.issue_ref}}", "prompt_template": FIX_PROMPT}})
 print("handler:", h3["name"])
 
-src = call("POST", "/v1/eventbus/sources", {
-    "name": "gh-ahsir-loop", "type": "github", "repo": REPO,
-    "kinds": "both", "state": "open", "interval": "2m",
-    "token_file": TOKEN_FILE})
-print("source:", src["name"], src["type"], src["interval"])
+# One github source per watched repo. Handlers are repo-agnostic (they match on
+# event TYPE + routing fields and template on {{.payload.repo}}), so the same
+# coder/reviewer serve every repo; only the poll source is per-repo.
+for repo in WATCH_REPOS:
+    name = "gh-" + repo.split("/")[-1] + "-loop"
+    src = call("POST", "/v1/eventbus/sources", {
+        "name": name, "type": "github", "repo": repo,
+        "kinds": "both", "state": "open", "interval": "2m",
+        "token_file": TOKEN_FILE})
+    print("source:", src["name"], "->", src["repo"], src["interval"])
 print("\\nDONE.")

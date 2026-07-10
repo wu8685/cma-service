@@ -23,12 +23,19 @@ gotchas below.
   that the PR adds tests exercising the new/changed behavior (measured via `go test -coverprofile`
   + `go tool cover -func`); missing tests on new logic ⇒ `changes` verdict. Pure-UI changes are
   flagged as out-of-headless-scope for a human / Playwright ui-verify.
-- **handlers** (keyed): `ahsir-build` (`type=issue` + `authorized=true` → coder, key `issue-{{.subject}}`;
-  `authorized` is the owner-backed approval gate — an `agent-build` label alone does NOT start work,
-  see the trust boundary in `docs/EVENTBUS-SOURCES.md`),
-  `ahsir-review` (`type=pr.push` + `is_agent_pr=true` → reviewer, key `pr-{{.subject}}`),
-  `ahsir-fix` (`type=pr.review` + `review_verdict=changes` → coder, key `issue-{{.payload.issue_ref}}` — same session as build).
-- **source** `gh-ahsir-loop` (`type=github`, repo, `kinds=both`, `interval=2m`, `token_file=~/.cma-stack/github-token`).
+- **handlers** (keyed, **repo-qualified keys**): `ahsir-build` (`type=issue` + `authorized=true` → coder,
+  key `{{.payload.repo}}#issue-{{.subject}}`; `authorized` is the owner-backed approval gate — an
+  `agent-build` label alone does NOT start work, see the trust boundary in `docs/EVENTBUS-SOURCES.md`),
+  `ahsir-review` (`type=pr.push` + `is_agent_pr=true` → reviewer, key `{{.payload.repo}}#pr-{{.subject}}`),
+  `ahsir-fix` (`type=pr.review` + `review_verdict=changes` → coder, key `{{.payload.repo}}#issue-{{.payload.issue_ref}}` — same session as build).
+  **Why repo-qualified:** the loop now watches more than one repo (below), and a bare `issue-{{.subject}}`
+  would collide two repos' issue #N onto one keyed session. build↔fix share a key so the coder that
+  built an issue also fixes it, with context.
+- **sources** — one `github` source **per watched repo** (`WATCH_REPOS` in the script), e.g.
+  `gh-ahsir-loop` → `wu8685/ahsir` and `gh-hetairoi-loop` → `wu8685/hetairoi` (each `kinds=both`,
+  `interval=2m`, `token_file=~/.cma-stack/github-token`). Handlers are repo-agnostic (match on event
+  TYPE + template on `{{.payload.repo}}`), so one coder/reviewer serves every repo — the loop dogfoods
+  itself by watching its own repos. (Validated 2026-07-10, end-to-end unattended on both repos.)
 - **NO** `approved` handler → reviewer's `approved` verdict HALTS the loop for human merge.
 
 ## Run it
@@ -36,7 +43,7 @@ gotchas below.
 # 0. ensure the 3-event source is in the deployed binary (rebuild+restart if source_github.go changed)
 # 1. verify PAT write scope on the target repo (avoids a wasted 403 turn):
 #    create+delete a temp branch ref via the API (Contents:write); Issues+PR write also needed.
-# 2. create the formation (edit REPO at top of the script for a different repo):
+# 2. create the formation (edit WATCH_REPOS at top of the script to watch different/more repos):
 python3 ~/.cma-stack/tools/setup-dev-loop.py
 # 3. kick off: as the repo OWNER, open an issue with the `agent-build` label (or, on a
 #    non-owner issue, post an owner `<!-- cma-approve -->` comment). The 2m poll picks it up.
@@ -46,8 +53,12 @@ Pause the loop (keeps handlers/agents): `curl -s --noproxy '*' -X DELETE http://
 
 ## Gotchas (the expensive-to-rediscover ones)
 1. **Loopback proxy.** This box has `http_proxy=127.0.0.1:7897`; loopback dies unless
-   `export no_proxy=127.0.0.1,localhost` per process and `curl --noproxy '*'`. External
-   (GitHub API) still uses the proxy. All LaunchAgent plists already bake in no_proxy.
+   `export no_proxy=127.0.0.1,localhost` per process and `curl --noproxy '*'`. **The daemon
+   inherits that proxy from launchd's global env** — and routing `api.github.com` through the flaky
+   7897 proxy makes every GitHub poll fail with `... : EOF` (whole loop silently idle). Fix: the
+   hetairoi plist `no_proxy` MUST include `github.com,api.github.com` so GitHub goes direct (verified:
+   direct returns 200, the proxy EOFs). Env change needs `bootout`+`bootstrap` (not kickstart).
+   Diagnose with `ps eww <pid> | tr ' ' '\n' | grep -i proxy`.
 2. **Single GitHub account can't self-approve.** GitHub blocks approve/request-changes
    on your OWN account's PR. So routing is by **event type** (coder⇒`pr.push`, reviewer⇒`pr.review`)
    + a **verdict marker in a PR comment** (`<!-- cma-review:approved -->` / `<!-- cma-review:changes -->`),
@@ -82,6 +93,40 @@ Pause the loop (keeps handlers/agents): `curl -s --noproxy '*' -X DELETE http://
    UI only lists registered agents. To view a deleted agent: re-register via `POST /admin/agents`
    `{name, workspace}` (no card → reuses the existing workspace, no re-scaffold). 30-day retention
    (`CompactForRetention` at agent startup) prunes older transcripts. (PR #2 added an "Archived" UI for this.)
+
+10. **Idle-reaper self-starvation (FIXED ahsir #20, deployed 2026-07-10).** The scheduler scales an
+    agent runtime to zero after `agent_idle_timeout=10m` idle. An event-driven loop is idle >10m
+    between bursts almost by definition, so the FIRST dispatch after any quiet period used to hit a
+    dead cached port → `dial 127.0.0.1:<port>: connection refused` → session terminal. The reviewer
+    (long gaps between PRs) was hit worst — every review died. Fix: `handleA2AProxy` now calls
+    `ensureAwake` before dialing, so a scaled-to-zero runtime re-spawns. Deployed-log signature of a
+    healthy wake: `idle-stopped → waking from idle-stopped → awake and healthy → <turn>`, zero
+    `connection refused`. If you see terminated sessions right after an idle period on an OLD binary,
+    this is why — redeploy. (Before the fix, the workaround was `bootout+bootstrap com.wu8685.ahsir`
+    to cold-start, or keeping the runtime warm with back-to-back turns <10m apart.)
+11. **git push through the proxy times out.** `wu8685/hetairoi`'s origin is **HTTPS** → pushes via the
+    7897 proxy fail `Recv failure: Operation timed out` (fetch sometimes squeaks through, push won't).
+    `wu8685/ahsir` is SSH. **Push over SSH regardless:** `git push git@github.com:wu8685/<repo>.git HEAD:<branch>`.
+12. **Deploy procedure (validated 2026-07-10).** Build straight to the deployed path + codesign (this
+    Mac SIGKILLs unsigned fresh binaries), then `bootout`+`bootstrap`. Order: **ahsir first** (owns
+    facade :18790), then hetairoi. ahsir's UI and scheduler share ONE `ahsir` binary (rebuild updates
+    both); `ahsir-agent` is a separate build. hetairoi runtime config (sources/handlers) persists in
+    `~/.cma-stack/eventbus/_registry.json` across restarts — it is NOT reset by a redeploy, so re-run
+    `setup-dev-loop.py` only when you intend to rebuild the formation.
+
+13. **Concurrent-safe agents (#18 instances / #19 session_isolation — reachable from facade since #25).**
+    By default one agent card = one runtime = one shared workspace, so two issues dispatched at once
+    make their coder sessions clobber each other's working tree — which is why multi-issue batches must
+    run **strictly sequentially** today. To lift that, set on the agent's `metadata` at creation:
+    `session_isolation: "worktree"` (per-session git worktree; **falls back to `scratch` per-session
+    dirs when the agent's workspace is not a git repo** — the loop's coder workspace isn't, so it gets
+    scratch, still collision-free) and/or `instances: "2"` (scheduler pools up to N isolated-workspace
+    instances, spawned on demand). The facade forwards both into the spawned agent's card /
+    `AgentConfig` (`internal/cmagateway/translate`). Validated 2026-07-10: a probe agent with
+    `instances=2, session_isolation=worktree` spawned with `pool.session_isolation: worktree` in its
+    card and ran two concurrent sessions under `Session isolation: mode=scratch` (worktree→scratch
+    fallback, no git workspace). `setup-dev-loop.py` still creates single-instance coder/reviewer — add
+    the two metadata keys there if you want the loop to process issues in parallel.
 
 ## Cost/safety
 - Each coder/reviewer turn ≈ a multi-minute opus turn ($). A full loop = several turns.
