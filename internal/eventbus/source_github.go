@@ -464,7 +464,7 @@ func (s *GitHubSource) listIssues(ctx context.Context, since time.Time) ([]ghIss
 	var all []ghIssue
 	for page := 1; page <= githubIssuesMaxPages; page++ {
 		var issues []ghIssue
-		headers, err := s.getJSONURL(ctx, current.String(), &issues)
+		headers, err := s.getJSONURLNoRedirect(ctx, current.String(), &issues)
 		if err != nil {
 			return nil, fmt.Errorf("github issues page %d: %w", page, err)
 		}
@@ -542,6 +542,20 @@ func (s *GitHubSource) getJSON(ctx context.Context, path string, v any) error {
 // getJSONURL performs the authenticated GitHub GET and returns response headers
 // so callers can consume pagination metadata without duplicating request policy.
 func (s *GitHubSource) getJSONURL(ctx context.Context, rawURL string, v any) (http.Header, error) {
+	return s.getJSONURLWithClient(ctx, rawURL, v, s.client())
+}
+
+// getJSONURLNoRedirect prevents a validated issue-list URL from redirecting to
+// an unvalidated endpoint before the next pagination request can be checked.
+func (s *GitHubSource) getJSONURLNoRedirect(ctx context.Context, rawURL string, v any) (http.Header, error) {
+	client := *s.client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return s.getJSONURLWithClient(ctx, rawURL, v, &client)
+}
+
+func (s *GitHubSource) getJSONURLWithClient(ctx context.Context, rawURL string, v any, client *http.Client) (http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -551,7 +565,7 @@ func (s *GitHubSource) getJSONURL(ctx context.Context, rawURL string, v any) (ht
 	if s.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+s.Token)
 	}
-	resp, err := s.client().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

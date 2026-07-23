@@ -195,6 +195,35 @@ func TestGitHubSource_PaginationSafetyAndTermination(t *testing.T) {
 			t.Fatalf("err=%v count=%d", err, count)
 		}
 	})
+	t.Run("redirect target is never requested", func(t *testing.T) {
+		issues, pulls := 0, 0
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/repos/o/r/issues":
+				issues++
+				if r.URL.Query().Get("page") == "2" {
+					http.Redirect(w, r, "/repos/o/r/pulls?page=2", http.StatusFound)
+					return
+				}
+				w.Header().Set("Link", "<"+srv.URL+"/repos/o/r/issues?page=2>; rel=\"next\"")
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+			case "/repos/o/r/pulls":
+				pulls++
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+		s := newGHSource(srv.URL)
+		s.meTried = true
+		old := time.Date(2026, 1, 6, 0, 0, 0, 0, time.UTC)
+		s.since = old
+		if _, err := s.Fetch(context.Background()); err == nil || issues != 2 || pulls != 0 || !s.since.Equal(old) {
+			t.Fatalf("err=%v issues=%d pulls=%d since=%v", err, issues, pulls, s.since)
+		}
+	})
 	t.Run("malformed link and detail failure preserve since", func(t *testing.T) {
 		for _, mode := range []string{"link", "detail"} {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
