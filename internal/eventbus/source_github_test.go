@@ -215,21 +215,32 @@ func TestGitHubSource_PaginationSafetyAndTermination(t *testing.T) {
 		}
 	})
 	t.Run("terminating pages succeed", func(t *testing.T) {
-		for _, link := range []string{"", `<https://example.test/x>; rel="last"`} {
-			count := 0
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				count++
-				if link != "" {
-					w.Header().Set("Link", link)
+		cases := []struct {
+			name   string
+			link   string
+			issues []map[string]any
+		}{
+			{name: "empty page", issues: []map[string]any{}},
+			{name: "exactly one full page", issues: make([]map[string]any, 100)},
+			{name: "non-next link", link: `<https://example.test/x>; rel="last"`, issues: make([]map[string]any, 100)},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				count := 0
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					count++
+					if tc.link != "" {
+						w.Header().Set("Link", tc.link)
+					}
+					_ = json.NewEncoder(w).Encode(tc.issues)
+				}))
+				s := newGHSource(srv.URL)
+				s.meTried = true
+				if _, err := s.Fetch(context.Background()); err != nil || count != 1 || s.since.IsZero() {
+					t.Fatalf("link=%q err=%v count=%d since=%v", tc.link, err, count, s.since)
 				}
-				_ = json.NewEncoder(w).Encode(make([]map[string]any, 100))
-			}))
-			s := newGHSource(srv.URL)
-			s.meTried = true
-			if _, err := s.Fetch(context.Background()); err != nil || count != 1 || s.since.IsZero() {
-				t.Fatalf("link=%q err=%v count=%d since=%v", link, err, count, s.since)
-			}
-			srv.Close()
+				srv.Close()
+			})
 		}
 	})
 }
