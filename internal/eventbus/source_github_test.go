@@ -47,6 +47,8 @@ func TestParseGitHubNextLink(t *testing.T) {
 		{"empty", "", "", false},
 		{"next among relations", `<https://api.example/repos/o/r/issues?page=2>; rel="next", <https://api.example/repos/o/r/issues?page=9>; rel="last"`, "https://api.example/repos/o/r/issues?page=2", false},
 		{"non-next", `<https://api.example/repos/o/r/issues?page=9>; rel="last"`, "", false},
+		{"comma in next URL", `<https://api.example/repos/o/r/issues?cursor=a,b>; rel="next"`, "https://api.example/repos/o/r/issues?cursor=a,b", false},
+		{"comma in quoted parameter", `<https://api.example/repos/o/r/issues?page=2>; title="a,b"; rel="next"`, "https://api.example/repos/o/r/issues?page=2", false},
 		{"malformed structure", `<https://api.example/x>; rel="next" garbage`, "", true},
 		{"malformed parameters", `<https://api.example/x>; rel=next`, "", true},
 		{"duplicate next", `<https://api.example/1>; rel="next", <https://api.example/2>; rel="next"`, "", true},

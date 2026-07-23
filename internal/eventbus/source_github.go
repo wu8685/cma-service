@@ -572,7 +572,7 @@ func parseGitHubNextLink(header string) (string, error) {
 	if header == "" {
 		return "", nil
 	}
-	parts := strings.Split(header, ",")
+	parts := splitGitHubLinkValues(header)
 	next := ""
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
@@ -625,6 +625,36 @@ func parseGitHubNextLink(header string) (string, error) {
 		}
 	}
 	return next, nil
+}
+
+// splitGitHubLinkValues separates Link-values without treating a comma inside a
+// URI reference or quoted parameter value as a value delimiter.
+func splitGitHubLinkValues(header string) []string {
+	parts := make([]string, 0, 1)
+	start := 0
+	inURI, inQuote := false, false
+	for i := 0; i < len(header); i++ {
+		switch header[i] {
+		case '<':
+			if !inQuote {
+				inURI = true
+			}
+		case '>':
+			if !inQuote {
+				inURI = false
+			}
+		case '"':
+			if !inURI {
+				inQuote = !inQuote
+			}
+		case ',':
+			if !inURI && !inQuote {
+				parts = append(parts, header[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, header[start:])
 }
 
 func canonicalGitHubURL(u *url.URL) string {
