@@ -42,9 +42,11 @@ Full design/history: `docs/RFC-001-cma-gateway-into-ahsir.md`.
   ahsir). Renaming it has a wide blast radius (every plist/token/path) — deferred.
 - **`CMA_*` env prefix kept on purpose** — Hetairoi *is* a CMA client, so
   `CMA_FACADE_URL` / `CMA_API_KEY` read correctly.
-- **Eventbus reliability** — the GitHub source has no retry on a failed poll, so a
-  transient `api.github.com` proxy blip can drop that cycle's events (tracked as an
-  issue). The event log is the source of truth for reconciliation.
+- **Eventbus reliability** — an ordinary GitHub fetch failure leaves the in-memory
+  `since` watermark unchanged, so the next polling interval retries that window
+  without dispatching a partial result. Restart downtime remains unresolved: the
+  source starts from `now`, and reconciliation/event-log recovery is still separate
+  follow-up work.
 - **Richer scenarios** — beyond the dev loop, the eventbus supports triage/routing
   patterns; new capability is usually a new source or policy, not new HTTP surface.
 

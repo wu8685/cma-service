@@ -126,8 +126,10 @@ type ghPull struct {
 // self-approval), so the reviewer instead posts a PR comment ending with one of
 // these markers, and the source routes on the parsed verdict.
 const (
-	reviewApproveMarker = "<!-- cma-review:approved -->"
-	reviewChangesMarker = "<!-- cma-review:changes -->"
+	reviewApproveMarker  = "<!-- cma-review:approved -->"
+	reviewChangesMarker  = "<!-- cma-review:changes -->"
+	githubIssuesPerPage  = 100
+	githubIssuesMaxPages = 10
 )
 
 // parseVerdict extracts the reviewer's verdict from a PR comment body.
@@ -171,10 +173,12 @@ func (s *GitHubSource) state() string {
 func (s *GitHubSource) issueType() string   { return orDefault(s.IssueType, "issue") }
 func (s *GitHubSource) pushType() string    { return orDefault(s.PushType, "pr.push") }
 func (s *GitHubSource) reviewType() string  { return orDefault(s.ReviewType, "pr.review") }
-func (s *GitHubSource) buildLabel() string    { return orDefault(s.BuildLabel, "agent-build") }
-func (s *GitHubSource) agentPrefix() string   { return orDefault(s.AgentPrefix, "agent/") }
-func (s *GitHubSource) botMarker() string     { return orDefault(s.BotMarker, "<!-- cma-agent -->") }
-func (s *GitHubSource) approveMarker() string { return orDefault(s.ApproveMarker, "<!-- cma-approve -->") }
+func (s *GitHubSource) buildLabel() string  { return orDefault(s.BuildLabel, "agent-build") }
+func (s *GitHubSource) agentPrefix() string { return orDefault(s.AgentPrefix, "agent/") }
+func (s *GitHubSource) botMarker() string   { return orDefault(s.BotMarker, "<!-- cma-agent -->") }
+func (s *GitHubSource) approveMarker() string {
+	return orDefault(s.ApproveMarker, "<!-- cma-approve -->")
+}
 
 // owner is the trusted author login. It defaults to the owner segment of Repo
 // ("owner/name" → "owner"), so the common case needs no extra config.
@@ -249,13 +253,13 @@ func (s *GitHubSource) Fetch(ctx context.Context) ([]Event, error) {
 		if isPR {
 			evs, err := s.prEvents(ctx, it, tickStart)
 			if err != nil {
-				return out, err
+				return nil, err
 			}
 			out = append(out, evs...)
 			continue
 		}
 		if ev, ok, err := s.issueEvent(ctx, it, tickStart); err != nil {
-			return out, err
+			return nil, err
 		} else if ok {
 			out = append(out, ev)
 		}
@@ -452,17 +456,48 @@ func latestOwnerVerdict(cs []ghComment, owner string, logf func(string, ...any),
 }
 
 func (s *GitHubSource) listIssues(ctx context.Context, since time.Time) ([]ghIssue, error) {
+	current, err := s.githubIssuesURL(since)
+	if err != nil {
+		return nil, err
+	}
+	requested := map[string]bool{canonicalGitHubURL(current): true}
+	var all []ghIssue
+	for page := 1; page <= githubIssuesMaxPages; page++ {
+		var issues []ghIssue
+		headers, err := s.getJSONURL(ctx, current.String(), &issues)
+		if err != nil {
+			return nil, fmt.Errorf("github issues page %d: %w", page, err)
+		}
+		all = append(all, issues...)
+		next, err := parseGitHubNextLink(headers.Get("Link"))
+		if err != nil {
+			return nil, fmt.Errorf("github issues page %d Link: %w", page, err)
+		}
+		if next == "" {
+			return all, nil
+		}
+		if page == githubIssuesMaxPages {
+			return nil, fmt.Errorf("github issues page %d: next link exceeds %d-page limit", page, githubIssuesMaxPages)
+		}
+		if err := validateGitHubIssuesNextURL(current, next, requested); err != nil {
+			return nil, fmt.Errorf("github issues page %d next link: %w", page, err)
+		}
+		current, _ = url.Parse(next)
+		requested[canonicalGitHubURL(current)] = true
+	}
+	return nil, fmt.Errorf("github issues: pagination limit exceeded")
+}
+
+func (s *GitHubSource) githubIssuesURL(since time.Time) (*url.URL, error) {
 	q := url.Values{}
 	q.Set("state", s.state())
 	q.Set("sort", "updated")
 	q.Set("direction", "desc")
-	q.Set("per_page", "50")
+	q.Set("per_page", strconv.Itoa(githubIssuesPerPage))
 	if !since.IsZero() {
 		q.Set("since", since.UTC().Format(time.RFC3339))
 	}
-	var issues []ghIssue
-	err := s.getJSON(ctx, "/repos/"+s.Repo+"/issues?"+q.Encode(), &issues)
-	return issues, err
+	return url.Parse(strings.TrimRight(s.apiBase(), "/") + "/repos/" + s.Repo + "/issues?" + q.Encode())
 }
 
 // commentsLastPage returns the newest page of comments on an issue/PR (ascending,
@@ -500,9 +535,16 @@ func (s *GitHubSource) me(ctx context.Context) (string, error) {
 }
 
 func (s *GitHubSource) getJSON(ctx context.Context, path string, v any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.apiBase()+path, nil)
+	_, err := s.getJSONURL(ctx, s.apiBase()+path, v)
+	return err
+}
+
+// getJSONURL performs the authenticated GitHub GET and returns response headers
+// so callers can consume pagination metadata without duplicating request policy.
+func (s *GitHubSource) getJSONURL(ctx context.Context, rawURL string, v any) (http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -511,14 +553,101 @@ func (s *GitHubSource) getJSON(ctx context.Context, path string, v any) error {
 	}
 	resp, err := s.client().Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
-		return fmt.Errorf("GET %s: %s: %s", path, resp.Status, bytes.TrimSpace(b))
+		return nil, fmt.Errorf("GET %s: %s: %s", req.URL.Path, resp.Status, bytes.TrimSpace(b))
 	}
-	return json.NewDecoder(resp.Body).Decode(v)
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return nil, err
+	}
+	return resp.Header.Clone(), nil
+}
+
+// parseGitHubNextLink returns the sole next URL in a GitHub Link header. A
+// non-empty malformed header is rejected rather than silently truncating a poll.
+func parseGitHubNextLink(header string) (string, error) {
+	if header == "" {
+		return "", nil
+	}
+	parts := strings.Split(header, ",")
+	next := ""
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "<") {
+			return "", fmt.Errorf("malformed Link structure")
+		}
+		end := strings.Index(part, ">")
+		if end <= 1 {
+			return "", fmt.Errorf("malformed Link structure")
+		}
+		target, rest := part[1:end], strings.TrimSpace(part[end+1:])
+		rels := ""
+		for rest != "" {
+			if !strings.HasPrefix(rest, ";") {
+				return "", fmt.Errorf("malformed Link parameters")
+			}
+			rest = strings.TrimSpace(rest[1:])
+			i := strings.Index(rest, "=")
+			if i <= 0 {
+				return "", fmt.Errorf("malformed Link parameters")
+			}
+			key := strings.TrimSpace(rest[:i])
+			rest = strings.TrimSpace(rest[i+1:])
+			if !strings.HasPrefix(rest, "\"") {
+				return "", fmt.Errorf("malformed Link parameters")
+			}
+			rest = rest[1:]
+			j := strings.Index(rest, "\"")
+			if j < 0 {
+				return "", fmt.Errorf("malformed Link parameters")
+			}
+			value := rest[:j]
+			rest = strings.TrimSpace(rest[j+1:])
+			if key == "rel" {
+				rels = value
+			}
+		}
+		for _, rel := range strings.Fields(rels) {
+			if rel == "next" {
+				if next != "" {
+					return "", fmt.Errorf("duplicate next relation")
+				}
+				next = target
+			}
+		}
+	}
+	return next, nil
+}
+
+func canonicalGitHubURL(u *url.URL) string {
+	v := *u
+	if q, err := url.ParseQuery(v.RawQuery); err == nil {
+		v.RawQuery = q.Encode()
+	}
+	return v.String()
+}
+
+func validateGitHubIssuesNextURL(initial *url.URL, raw string, requested map[string]bool) error {
+	next, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL")
+	}
+	if !next.IsAbs() || next.User != nil || next.Fragment != "" {
+		return fmt.Errorf("next URL must be absolute, without userinfo or fragment")
+	}
+	if next.Scheme != initial.Scheme || next.Host != initial.Host {
+		return fmt.Errorf("next URL origin differs")
+	}
+	if next.Path != initial.Path {
+		return fmt.Errorf("next URL is not the repository issues endpoint")
+	}
+	if requested[canonicalGitHubURL(next)] {
+		return fmt.Errorf("next URL cycle")
+	}
+	return nil
 }
 
 func labelNames(ls []ghLabel) []string {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ghFakeAPI is a minimal GitHub REST stand-in for the source tests.
@@ -17,6 +18,220 @@ type ghFakeAPI struct {
 	issues   []map[string]any         // /issues listing (issues + PRs)
 	comments map[int][]map[string]any // issue/PR number -> comments (ascending)
 	pulls    map[int]map[string]any   // PR number -> /pulls/{n} detail
+}
+
+func TestGitHubSource_getJSONURLReturnsHeadersAndAuth(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Link", `<https://example.test/next>; rel="next"`)
+		_ = json.NewEncoder(w).Encode(map[string]string{"login": "bot"})
+	}))
+	defer srv.Close()
+	s := newGHSource(srv.URL)
+	var user ghUser
+	h, err := s.getJSONURL(context.Background(), srv.URL+"/user", &user)
+	if err != nil {
+		t.Fatalf("getJSONURL: %v", err)
+	}
+	if gotAuth != "Bearer t" || h.Get("Link") == "" || user.Login != "bot" {
+		t.Fatalf("auth=%q link=%q user=%q", gotAuth, h.Get("Link"), user.Login)
+	}
+}
+
+func TestParseGitHubNextLink(t *testing.T) {
+	cases := []struct {
+		name, link, want string
+		wantErr          bool
+	}{
+		{"empty", "", "", false},
+		{"next among relations", `<https://api.example/repos/o/r/issues?page=2>; rel="next", <https://api.example/repos/o/r/issues?page=9>; rel="last"`, "https://api.example/repos/o/r/issues?page=2", false},
+		{"non-next", `<https://api.example/repos/o/r/issues?page=9>; rel="last"`, "", false},
+		{"malformed structure", `<https://api.example/x>; rel="next" garbage`, "", true},
+		{"malformed parameters", `<https://api.example/x>; rel=next`, "", true},
+		{"duplicate next", `<https://api.example/1>; rel="next", <https://api.example/2>; rel="next"`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseGitHubNextLink(tc.link)
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Fatalf("got (%q,%v), want (%q,err=%v)", got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestGitHubIssuesNextURL(t *testing.T) {
+	s := newGHSource("https://ghe.example/api/v3")
+	initial, err := s.githubIssuesURL(time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, raw string
+		wantErr   bool
+	}{
+		{"valid GHE prefix", "https://ghe.example/api/v3/repos/o/r/issues?page=2", false},
+		{"relative", "/api/v3/repos/o/r/issues?page=2", true},
+		{"cross origin", "https://else.example/api/v3/repos/o/r/issues?page=2", true},
+		{"wrong endpoint", "https://ghe.example/api/v3/repos/o/r/pulls?page=2", true},
+		{"userinfo", "https://x@ghe.example/api/v3/repos/o/r/issues?page=2", true},
+		{"fragment", "https://ghe.example/api/v3/repos/o/r/issues?page=2#bad", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateGitHubIssuesNextURL(initial, tc.raw, map[string]bool{}); (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+	permuted := *initial
+	permuted.RawQuery = "sort=updated&state=open&per_page=100&direction=desc"
+	if err := validateGitHubIssuesNextURL(initial, permuted.String(), map[string]bool{canonicalGitHubURL(initial): true}); err == nil {
+		t.Fatal("canonicalized query cycle accepted")
+	}
+}
+
+func TestGitHubSource_IssuePaginationAndFailures(t *testing.T) {
+	t.Run("two pages follows supplied next", func(t *testing.T) {
+		var requests []string
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests = append(requests, r.URL.String())
+			if r.URL.Query().Get("page") == "2" {
+				_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 101, "user": map[string]any{"login": "wu8685"}, "updated_at": "2026-01-01T00:00:00Z"}})
+				return
+			}
+			w.Header().Set("Link", "<"+srv.URL+"/repos/o/r/issues?page=2>; rel=\"next\"")
+			_ = json.NewEncoder(w).Encode(make([]map[string]any, 100))
+		}))
+		defer srv.Close()
+		s := newGHSource(srv.URL)
+		s.meTried = true
+		issues, err := s.listIssues(context.Background(), time.Time{})
+		if err != nil || len(issues) != 101 || len(requests) != 2 || !strings.Contains(requests[0], "per_page=100") {
+			t.Fatalf("issues=%d requests=%v err=%v", len(issues), requests, err)
+		}
+	})
+	t.Run("page failure preserves since", func(t *testing.T) {
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("page") == "2" {
+				http.Error(w, "no", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Link", "<"+srv.URL+"/repos/o/r/issues?page=2>; rel=\"next\"")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		}))
+		defer srv.Close()
+		s := newGHSource(srv.URL)
+		s.meTried = true
+		old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		s.since = old
+		if _, err := s.Fetch(context.Background()); err == nil || !s.since.Equal(old) {
+			t.Fatalf("err=%v since=%v", err, s.since)
+		}
+	})
+}
+
+func TestGitHubSource_PaginationSafetyAndTermination(t *testing.T) {
+	t.Run("page ten next is not fetched", func(t *testing.T) {
+		count := 0
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			count++
+			w.Header().Set("Link", "<"+srv.URL+"/repos/o/r/issues?page="+strconv.Itoa(count+1)+">; rel=\"next\"")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		}))
+		defer srv.Close()
+		s := newGHSource(srv.URL)
+		s.meTried = true
+		old := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+		s.since = old
+		if _, err := s.Fetch(context.Background()); err == nil || count != 10 || !s.since.Equal(old) {
+			t.Fatalf("err=%v count=%d since=%v", err, count, s.since)
+		}
+	})
+	t.Run("bad links are never requested", func(t *testing.T) {
+		for _, raw := range []string{"https://elsewhere.invalid/repos/o/r/issues?page=2", "https://example.invalid/repos/o/r/pulls?page=2"} {
+			count := 0
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				count++
+				w.Header().Set("Link", "<"+raw+">; rel=\"next\"")
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+			}))
+			s := newGHSource(srv.URL)
+			s.meTried = true
+			old := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+			s.since = old
+			if _, err := s.Fetch(context.Background()); err == nil || count != 1 || !s.since.Equal(old) {
+				t.Fatalf("link=%q err=%v count=%d", raw, err, count)
+			}
+			srv.Close()
+		}
+	})
+	t.Run("cycle is rejected before repeat", func(t *testing.T) {
+		count := 0
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			count++
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "2"
+			}
+			w.Header().Set("Link", "<"+srv.URL+"/repos/o/r/issues?page="+page+">; rel=\"next\"")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		}))
+		defer srv.Close()
+		s := newGHSource(srv.URL)
+		s.meTried = true
+		old := time.Date(2026, 1, 4, 0, 0, 0, 0, time.UTC)
+		s.since = old
+		if _, err := s.Fetch(context.Background()); err == nil || count != 2 || !s.since.Equal(old) {
+			t.Fatalf("err=%v count=%d", err, count)
+		}
+	})
+	t.Run("malformed link and detail failure preserve since", func(t *testing.T) {
+		for _, mode := range []string{"link", "detail"} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/pulls/") {
+					http.Error(w, "no", http.StatusInternalServerError)
+					return
+				}
+				if mode == "link" {
+					w.Header().Set("Link", "not a link")
+				}
+				_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 7, "user": map[string]any{"login": "wu8685"}, "updated_at": "2026-01-01T00:00:00Z", "pull_request": map[string]any{"url": "x"}}})
+			}))
+			s := newGHSource(srv.URL)
+			s.meTried = true
+			old := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
+			s.since = old
+			if _, err := s.Fetch(context.Background()); err == nil || !s.since.Equal(old) {
+				t.Fatalf("mode=%s err=%v since=%v", mode, err, s.since)
+			}
+			srv.Close()
+		}
+	})
+	t.Run("terminating pages succeed", func(t *testing.T) {
+		for _, link := range []string{"", `<https://example.test/x>; rel="last"`} {
+			count := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				count++
+				if link != "" {
+					w.Header().Set("Link", link)
+				}
+				_ = json.NewEncoder(w).Encode(make([]map[string]any, 100))
+			}))
+			s := newGHSource(srv.URL)
+			s.meTried = true
+			if _, err := s.Fetch(context.Background()); err != nil || count != 1 || s.since.IsZero() {
+				t.Fatalf("link=%q err=%v count=%d since=%v", link, err, count, s.since)
+			}
+			srv.Close()
+		}
+	})
 }
 
 func (f ghFakeAPI) server() *httptest.Server {
