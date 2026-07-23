@@ -585,6 +585,7 @@ func parseGitHubNextLink(header string) (string, error) {
 		}
 		target, rest := part[1:end], strings.TrimSpace(part[end+1:])
 		rels := ""
+		hasRel := false
 		for rest != "" {
 			if !strings.HasPrefix(rest, ";") {
 				return "", fmt.Errorf("malformed Link parameters")
@@ -607,6 +608,10 @@ func parseGitHubNextLink(header string) (string, error) {
 			value := rest[:j]
 			rest = strings.TrimSpace(rest[j+1:])
 			if key == "rel" {
+				if hasRel {
+					return "", fmt.Errorf("duplicate rel parameter")
+				}
+				hasRel = true
 				rels = value
 			}
 		}

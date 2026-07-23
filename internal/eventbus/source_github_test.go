@@ -50,6 +50,7 @@ func TestParseGitHubNextLink(t *testing.T) {
 		{"malformed structure", `<https://api.example/x>; rel="next" garbage`, "", true},
 		{"malformed parameters", `<https://api.example/x>; rel=next`, "", true},
 		{"duplicate next", `<https://api.example/1>; rel="next", <https://api.example/2>; rel="next"`, "", true},
+		{"duplicate rel parameter", `<https://api.example/repos/o/r/issues?page=2>; rel="next"; rel="next"`, "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
