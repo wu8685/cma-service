@@ -47,6 +47,7 @@ func TestParseGitHubNextLink(t *testing.T) {
 		{"empty", "", "", false},
 		{"next among relations", `<https://api.example/repos/o/r/issues?page=2>; rel="next", <https://api.example/repos/o/r/issues?page=9>; rel="last"`, "https://api.example/repos/o/r/issues?page=2", false},
 		{"non-next", `<https://api.example/repos/o/r/issues?page=9>; rel="last"`, "", false},
+		{"malformed non-next target", `<https://api.example/%zz>; rel="last"`, "", true},
 		{"comma in next URL", `<https://api.example/repos/o/r/issues?cursor=a,b>; rel="next"`, "https://api.example/repos/o/r/issues?cursor=a,b", false},
 		{"comma in quoted parameter", `<https://api.example/repos/o/r/issues?page=2>; title="a,b"; rel="next"`, "https://api.example/repos/o/r/issues?page=2", false},
 		{"malformed structure", `<https://api.example/x>; rel="next" garbage`, "", true},
@@ -156,23 +157,53 @@ func TestGitHubSource_PaginationSafetyAndTermination(t *testing.T) {
 		}
 	})
 	t.Run("bad links are never requested", func(t *testing.T) {
-		for _, raw := range []string{"https://elsewhere.invalid/repos/o/r/issues?page=2", "https://example.invalid/repos/o/r/pulls?page=2"} {
-			count := 0
-			var srv *httptest.Server
-			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				count++
-				w.Header().Set("Link", "<"+raw+">; rel=\"next\"")
+		t.Run("cross origin target", func(t *testing.T) {
+			targetRequests := 0
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetRequests++
+				http.NotFound(w, r)
+			}))
+			defer target.Close()
+			sourceRequests := 0
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sourceRequests++
+				w.Header().Set("Link", "<"+target.URL+"/repos/o/r/issues?page=2>; rel=\"next\"")
 				_ = json.NewEncoder(w).Encode([]map[string]any{})
 			}))
+			defer source.Close()
+			s := newGHSource(source.URL)
+			s.meTried = true
+			old := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+			s.since = old
+			if _, err := s.Fetch(context.Background()); err == nil || sourceRequests != 1 || targetRequests != 0 || !s.since.Equal(old) {
+				t.Fatalf("err=%v source=%d target=%d since=%v", err, sourceRequests, targetRequests, s.since)
+			}
+		})
+		t.Run("same origin wrong path", func(t *testing.T) {
+			issues, pulls := 0, 0
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/repos/o/r/issues":
+					issues++
+					w.Header().Set("Link", "<"+srv.URL+"/repos/o/r/pulls?page=2>; rel=\"next\"")
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				case "/repos/o/r/pulls":
+					pulls++
+					http.NotFound(w, r)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
 			s := newGHSource(srv.URL)
 			s.meTried = true
 			old := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
 			s.since = old
-			if _, err := s.Fetch(context.Background()); err == nil || count != 1 || !s.since.Equal(old) {
-				t.Fatalf("link=%q err=%v count=%d", raw, err, count)
+			if _, err := s.Fetch(context.Background()); err == nil || issues != 1 || pulls != 0 || !s.since.Equal(old) {
+				t.Fatalf("err=%v issues=%d pulls=%d since=%v", err, issues, pulls, s.since)
 			}
-			srv.Close()
-		}
+		})
 	})
 	t.Run("cycle is rejected before repeat", func(t *testing.T) {
 		count := 0

@@ -598,6 +598,9 @@ func parseGitHubNextLink(header string) (string, error) {
 			return "", fmt.Errorf("malformed Link structure")
 		}
 		target, rest := part[1:end], strings.TrimSpace(part[end+1:])
+		if _, err := url.ParseRequestURI(target); err != nil {
+			return "", fmt.Errorf("malformed Link target")
+		}
 		rels := ""
 		hasRel := false
 		for rest != "" {
