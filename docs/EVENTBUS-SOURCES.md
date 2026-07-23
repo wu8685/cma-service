@@ -146,6 +146,16 @@ resolves the bot login via `GET /user`. For a full coding loop the PAT needs, on
 the target repo: **Contents + Issues + Pull requests: Read and write** (clone,
 push, open PRs, comment). Probe write access first with a temp-branch create/delete.
 
+**Issue pagination and failure semantics.** Each GitHub issue-list request uses
+`per_page=100`, retaining the selected state, updated-descending sort, and any
+incremental `since` cursor. The source follows only validated absolute `Link:
+rel="next"` URLs (same API origin and exact repository-issues path) for at most
+10 pages per poll. Malformed, duplicate, cyclic, cross-origin, or wrong-endpoint
+links fail the entire fetch. Any list-page, decode, Link, or item-detail failure
+dispatches no events and does not advance `since`; the next poll retries from the
+unchanged watermark. This bounds a single live traversal, but does not close the
+separate downtime/restart gap described below.
+
 **Routing without author identity (single-account safe).** The coder only ever
 produces `pr.push`, the reviewer only ever produces `pr.review`, so routing on the
 event *type* never self-triggers even when both act as the same GitHub account.
@@ -156,7 +166,9 @@ and the source exposes it as `review_verdict`. The `issue` event keeps a
 comment on an issue doesn't re-trigger it.
 
 **No boot replay.** On (re)start the window begins at `now`, so the source acts
-only on activity *after* startup — a restart never replays history.
+only on activity *after* startup — a restart never replays history. This remains a
+separate restart/downtime gap; pagination protects an active poll traversal, not
+events that happened while the source was stopped.
 
 See [`tools/DEV-LOOP-PLAYBOOK.md`](../tools/DEV-LOOP-PLAYBOOK.md) (+ `tools/setup-dev-loop.py`,
 `tools/ui-verify.py`) for the full agent/handler formation this source drives.
